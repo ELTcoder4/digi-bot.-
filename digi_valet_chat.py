@@ -33,12 +33,367 @@ import struct
 from datetime import datetime
 from pathlib import Path
 
+
+# ── OrgTree (fully embedded — no external file needed) ────────────────────────
+class OrgTree:
+    """
+    Embedded org-chart lookup backed by OrgTree.csv.
+    Columns expected: Employee Number, Display Name, Job Title,
+                      Department, Location, Reportees Count
+    """
+    loaded = False
+    source_path = None
+
+    def __init__(self):
+        self.employees: dict = {}   # emp_number.lower() → record dict
+        self._name_index: dict = {} # display_name.lower() → emp_number
+
+    def load_from_csv(self, path: str) -> str:
+        import csv as _csv
+        try:
+            with open(path, newline='', encoding='utf-8-sig') as f:
+                reader = _csv.DictReader(f)
+                raw_headers = reader.fieldnames or []
+                headers = [h.strip() for h in raw_headers]
+                # Normalise common column name variants
+                _col = {}
+                for h in headers:
+                    hl = h.lower().replace(' ', '_').replace('-', '_')
+                    for canon, variants in {
+                        'emp_number': ['employee_number', 'emp_no', 'emp_id', 'id'],
+                        'name':       ['display_name', 'full_name', 'employee_name', 'name'],
+                        'title':      ['job_title', 'designation', 'role', 'position'],
+                        'dept':       ['department', 'dept', 'division', 'team'],
+                        'location':   ['location', 'city', 'office', 'site'],
+                        'reports':    ['reportees_count', 'reportees', 'direct_reports', 'reports'],
+                    }.items():
+                        if hl in variants or canon in hl:
+                            _col[canon] = h
+                            break
+
+                self.employees.clear()
+                self._name_index.clear()
+                for row in reader:
+                    row = {k.strip(): (v or '').strip() for k, v in row.items()}
+                    emp_no  = row.get(_col.get('emp_number',''), '').strip()
+                    name    = row.get(_col.get('name',''), '').strip()
+                    title   = row.get(_col.get('title',''), '').strip()
+                    dept    = row.get(_col.get('dept',''), '').strip()
+                    loc     = row.get(_col.get('location',''), '').strip()
+                    reports = row.get(_col.get('reports',''), '0').strip()
+                    if not (emp_no or name):
+                        continue
+                    try:
+                        rc = int(str(reports).split('.')[0])
+                    except (ValueError, AttributeError):
+                        rc = 0
+                    key = (emp_no or name).lower()
+                    record = {
+                        'emp_number': emp_no, 'name': name, 'title': title,
+                        'dept': dept, 'location': loc, 'reports_count': rc
+                    }
+                    self.employees[key] = record
+                    if name:
+                        self._name_index[name.lower()] = key
+
+            self.loaded = True
+            self.source_path = path
+            return f"✓ OrgTree loaded: {len(self.employees)} employees from {path}"
+        except Exception as e:
+            self.loaded = False
+            return f"⚠️ OrgTree load error: {e}"
+
+    def get_employee(self, query: str):
+        q = query.strip().lower()
+        if q in self.employees:
+            return self.employees[q]
+        if q in self._name_index:
+            return self.employees[self._name_index[q]]
+        return None
+
+    def search(self, query: str, limit: int = 30) -> list:
+        q = query.strip().lower()
+        results = []
+        for rec in self.employees.values():
+            haystack = ' '.join([
+                rec.get('emp_number',''), rec.get('name',''),
+                rec.get('title',''), rec.get('dept',''), rec.get('location','')
+            ]).lower()
+            if q in haystack:
+                results.append(rec)
+                if len(results) >= limit:
+                    break
+        return results
+
+    def list_by_department(self, dept: str, limit: int = 50) -> list:
+        d = dept.strip().lower()
+        return [r for r in self.employees.values() if d in r.get('dept','').lower()][:limit]
+
+    def list_by_location(self, loc: str, limit: int = 50) -> list:
+        l = loc.strip().lower()
+        return [r for r in self.employees.values() if l in r.get('location','').lower()][:limit]
+
+    def stats(self) -> dict:
+        from collections import Counter
+        depts = Counter(r.get('dept','—') for r in self.employees.values())
+        locs  = Counter(r.get('location','—') for r in self.employees.values())
+        return {
+            'total': len(self.employees),
+            'departments': dict(depts.most_common(30)),
+            'locations':   dict(locs.most_common(20)),
+        }
+
+    def to_context_snippet(self, max_rows: int = 200) -> str:
+        if not self.loaded:
+            return ""
+        lines = ["Emp# | Name | Title | Dept | Location | Reports"]
+        for rec in list(self.employees.values())[:max_rows]:
+            lines.append(
+                f"{rec.get('emp_number','')} | {rec.get('name','')} | "
+                f"{rec.get('title','')} | {rec.get('dept','')} | "
+                f"{rec.get('location','')} | {rec.get('reports_count',0)}"
+            )
+        return '\n'.join(lines)
+
+    @staticmethod
+    def format_employee(info: dict) -> str:
+        if not info:
+            return "Employee not found."
+        return (
+            f"**{info.get('name','—')}**  (`{info.get('emp_number','—')}`)\n\n"
+            f"- **Title:** {info.get('title','—')}\n"
+            f"- **Department:** {info.get('dept','—')}\n"
+            f"- **Location:** {info.get('location','—')}\n"
+            f"- **Direct Reports:** {info.get('reports_count', 0)}"
+        )
+
+    @staticmethod
+    def format_results_table(results: list) -> str:
+        if not results:
+            return "No results."
+        lines = ["| Emp# | Name | Title | Dept | Location | Reports |",
+                 "|---|---|---|---|---|---|"]
+        for r in results:
+            lines.append(
+                f"| {r.get('emp_number','')} | {r.get('name','')} | "
+                f"{r.get('title','')} | {r.get('dept','')} | "
+                f"{r.get('location','')} | {r.get('reports_count',0)} |"
+            )
+        return '\n'.join(lines)
+
+_ORG_TREE_AVAILABLE = True   # always available — it's embedded above
+
+# ── KnowledgeBase (embedded) ──────────────────────────────────────────────────
+class KnowledgeBase:
+    """Persistent per-user knowledge store backed by a JSON file."""
+    def __init__(self, kb_path=None):
+        from pathlib import Path as _Path
+        self._path = _Path(kb_path) if kb_path else _Path.home() / ".digi_valet_kb.json"
+        self._data: dict = self._load()
+
+    def _load(self) -> dict:
+        try:
+            if self._path.exists():
+                import json as _j
+                return _j.loads(self._path.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        return {"files": {}, "notes": []}
+
+    def _save(self):
+        import json as _j
+        try:
+            self._path.write_text(_j.dumps(self._data, indent=2, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            print(f"KB save error: {e}")
+
+    def is_empty(self) -> bool:
+        return not self._data.get("files") and not self._data.get("notes")
+
+    def list_files(self) -> list:
+        return [{"filename": k, **v} for k, v in self._data.get("files", {}).items()]
+
+    def learn_file(self, filepath: str) -> str:
+        from pathlib import Path as _Path
+        p = _Path(filepath)
+        _, content = _read_file_content(filepath)
+        self._data.setdefault("files", {})[p.name] = {
+            "path": str(p), "content": content,
+            "learned_at": datetime.now().isoformat()
+        }
+        self._save()
+        return f"✓ Learned: {p.name}"
+
+    def forget_file(self, filename: str) -> str:
+        if filename in self._data.get("files", {}):
+            del self._data["files"][filename]
+            self._save()
+            return f"✓ Forgotten: {filename}"
+        return f"File '{filename}' not found in knowledge base."
+
+    def system_prompt_block(self) -> str:
+        lines = ["# Persistent Knowledge Base\n"]
+        for fname, info in self._data.get("files", {}).items():
+            lines.append(f"## {fname}\n{info.get('content','')[:4000]}\n")
+        for note in self._data.get("notes", [])[:20]:
+            lines.append(f"- {note}")
+        return '\n'.join(lines)
+
+    def format_kb_status(self) -> str:
+        """Return a human-readable summary of the knowledge base contents."""
+        files = self._data.get("files", {})
+        notes = self._data.get("notes", [])
+        if not files and not notes:
+            return (
+                "📚 **Knowledge Base** — empty\n\n"
+                "Attach a file and type `/kb learn` to store it permanently, "
+                "or say **'learn this file'** after attaching."
+            )
+        lines = [f"📚 **Knowledge Base** — {len(files)} file(s) stored\n"]
+        for fname, info in files.items():
+            size = len(info.get("content", ""))
+            learned = info.get("learned_at", "")[:10]
+            lines.append(f"• **{fname}** — {size:,} chars — learned {learned}")
+        if notes:
+            lines.append(f"\n{len(notes)} note(s) stored.")
+        lines.append(
+            "\n**Commands:** `/kb learn` · `/kb forget <filename>` · `/kb clear` · `/kb help`"
+        )
+        return "\n".join(lines)
+
+# ── Excel Intelligence (embedded) ─────────────────────────────────────────────
 try:
-    from org_tree import OrgTree
+    from excel_intelligence import ExcelIntelligence as _ExcelIntelligence
+    _excel_intel = _ExcelIntelligence()
+    print("[Digi Valet] ✓ Excel Intelligence loaded")
 except ImportError:
-    class OrgTree:
-        def __init__(self, *a, **kw): self.loaded = False
-        def load_from_csv(self, *a): return "OrgTree not available"
+    _excel_intel = None
+
+# ── Programming Knowledge Base (embedded directly) ────────────────────────────
+PROGRAMMING_KNOWLEDGE = """
+══════════════════════════════════════════════════════════════════════
+PROGRAMMING & MACHINE LEARNING KNOWLEDGE BASE
+You are an expert software engineer and ML scientist. Use this
+knowledge to answer ANY programming or ML question accurately.
+══════════════════════════════════════════════════════════════════════
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1: PYTHON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Python is a high-level, interpreted, dynamically typed language.
+BASICS: variables (x=10), lists ([1,2,3]), dicts ({'a':1}), sets ({1,2,3}), tuples ((1,2,3)).
+CONTROL FLOW: if/elif/else, for/while loops, list comprehensions [x**2 for x in range(10)].
+FUNCTIONS: def greet(name, greeting="Hi"): return f"{greeting} {name}"
+  lambda x: x*2   |   *args/**kwargs   |   decorators (@functools.wraps)
+OOP: class Animal: def __init__(self,name): self.name=name  |  inheritance, super(), dunder methods
+EXCEPTIONS: try/except/finally/raise  |  custom exceptions (class MyError(Exception))
+FILE I/O: open('f','r') as f: f.read()  |  pathlib.Path
+MODULES: import os,sys,json,re,math,datetime,collections,itertools,functools
+ASYNC: async def fetch(): await asyncio.sleep(1)
+POPULAR LIBS: numpy (arrays), pandas (DataFrames), matplotlib (plots), requests (HTTP),
+  scikit-learn (ML), Flask/FastAPI (web), SQLAlchemy (ORM), pytest (testing)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2: JAVA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Statically typed, JVM-based. public class Main { public static void main(String[] args){} }
+Types: int, double, boolean, String, int[], ArrayList<>, HashMap<>
+OOP: extends (inheritance), implements (interface), abstract classes, @Override
+Exceptions: try/catch/finally, throws, checked vs unchecked
+Collections: List, Set, Map, Queue, Iterator
+Streams: list.stream().filter(x->x>0).map(x->x*2).collect(Collectors.toList())
+Threads: Runnable, Thread, synchronized, ExecutorService
+Java 8+: lambdas (x -> x*2), Optional, LocalDate, var (Java 10+), records (Java 16+)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3: C / C++
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+C: #include <stdio.h>  int main(){ printf("hi"); return 0; }
+  pointers (*ptr, &var), malloc/free, structs, arrays, string.h functions
+C++: classes with constructors/destructors, new/delete, RAII
+  STL: vector, map, set, queue, stack, algorithm (sort, find, etc.)
+  Templates: template<typename T> T max(T a,T b){return a>b?a:b;}
+  Smart pointers: unique_ptr, shared_ptr, weak_ptr
+  Lambda: auto f = [](int x){ return x*2; };
+  C++11/14/17/20: range-for, auto, constexpr, structured bindings, concepts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4: C# / .NET
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+using System; namespace App { class Program { static void Main(){} } }
+Types: int,double,bool,string,var  |  nullable: int?  |  dynamic
+OOP: public/private/protected, sealed, abstract, interface, partial
+LINQ: list.Where(x=>x>0).Select(x=>x*2).ToList()
+Async: async Task<int> GetData() { await Task.Delay(1000); return 42; }
+Collections: List<T>, Dictionary<K,V>, HashSet<T>, IEnumerable<T>
+.NET: Console, File/Directory, HttpClient, Entity Framework, ASP.NET Core
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5: JAVASCRIPT / TYPESCRIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+JS: var/let/const, arrow functions (x=>x*2), template literals (`${x}`)
+  Array methods: map, filter, reduce, find, some, every, flat, flatMap
+  Objects: destructuring ({a,b}=obj), spread ({...obj}), optional chaining (obj?.a)
+  Async: Promise, async/await, fetch API, try/catch
+  Classes: class Animal { constructor(name){this.name=name} speak(){} }
+  Modules: import {fn} from './mod.js'  |  export default fn
+DOM: document.querySelector, addEventListener, innerHTML, classList
+Node.js: require/module.exports, fs, path, http, Express.js
+TypeScript: type annotations (x:number), interfaces, generics <T>, enums, utility types
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6: SQL & DATABASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SELECT col FROM tbl WHERE cond GROUP BY col HAVING agg ORDER BY col LIMIT n
+JOINs: INNER, LEFT, RIGHT, FULL OUTER, CROSS, SELF
+Aggregates: COUNT(*), SUM(x), AVG(x), MAX/MIN(x), GROUP_CONCAT
+Subqueries: SELECT * FROM t WHERE x IN (SELECT x FROM t2)
+Window: ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC)
+Indexes: CREATE INDEX idx ON tbl(col)  — speeds up reads, slows writes
+Transactions: BEGIN; UPDATE ...; COMMIT; / ROLLBACK;
+NoSQL: MongoDB (documents/BSON), Redis (key-value), Cassandra (wide-column)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7: MACHINE LEARNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SUPERVISED: regression (predict continuous), classification (predict category)
+  Algorithms: Linear/Logistic Regression, Decision Tree, Random Forest, SVM,
+              KNN, Naive Bayes, XGBoost/LightGBM, Neural Networks
+UNSUPERVISED: clustering (K-Means, DBSCAN, hierarchical), dimensionality reduction (PCA, t-SNE, UMAP)
+EVALUATION:
+  Classification: accuracy, precision, recall, F1, ROC-AUC, confusion matrix
+  Regression: MAE, MSE, RMSE, R²
+  Cross-validation: k-fold, stratified k-fold
+COMMON WORKFLOW (scikit-learn):
+  from sklearn.ensemble import RandomForestClassifier
+  from sklearn.model_selection import train_test_split, cross_val_score
+  from sklearn.preprocessing import StandardScaler
+  X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=0.2)
+  model = RandomForestClassifier(); model.fit(X_train,y_train)
+  print(model.score(X_test,y_test))
+DEEP LEARNING (PyTorch):
+  import torch, torch.nn as nn
+  class Net(nn.Module):
+      def __init__(self): super().__init__(); self.fc=nn.Linear(10,1)
+      def forward(self,x): return self.fc(x)
+  optimizer=torch.optim.Adam(net.parameters()); loss_fn=nn.MSELoss()
+FEATURE ENGINEERING: one-hot encoding, label encoding, normalization (0-1), standardization (z-score),
+  missing value imputation, outlier removal, log transforms, polynomial features
+OVERFITTING FIXES: regularization (L1/L2), dropout, early stopping, data augmentation, cross-validation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8: DATA STRUCTURES & ALGORITHMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DS: Array O(1) access, LinkedList O(1) insert/delete, Stack (LIFO), Queue (FIFO),
+    HashMap O(1) avg, BST O(log n), Heap (priority queue), Graph (adj list/matrix)
+SORTING: Bubble O(n²), Merge O(n log n), Quick O(n log n) avg, Heap O(n log n), Counting O(n+k)
+SEARCHING: Linear O(n), Binary O(log n) [sorted array], BFS/DFS O(V+E) [graphs]
+PATTERNS: Two pointers, Sliding window, Fast/slow pointers, Prefix sum, Monotonic stack
+DP: memoization (top-down), tabulation (bottom-up) — Fibonacci, LCS, Knapsack, Coin change
+GRAPHS: BFS (shortest path unweighted), DFS (cycle detection, topological sort),
+        Dijkstra (weighted shortest path), Union-Find (connected components)
+BIG-O: O(1)<O(log n)<O(n)<O(n log n)<O(n²)<O(2ⁿ)<O(n!)
+"""
 
 
 # ─── Universal File Reader ────────────────────────────────────────────────────
@@ -46,7 +401,8 @@ except ImportError:
 def _read_file_content(path: str) -> tuple[str, str]:
     """
     Read any file and return (display_name, extracted_text).
-    Handles: text, code, PDF, DOCX, XLSX, CSV, images (base64 desc), ZIP, etc.
+    For code files: numbered lines + metadata (total lines, functions, classes, imports).
+    For documents: full text with page/section info.
     Never crashes — always returns something useful.
     """
     p = Path(path)
@@ -65,19 +421,130 @@ def _read_file_content(path: str) -> tuple[str, str]:
         '.vue', '.svelte', '.env', '.gitignore', '.dockerfile',
         '.makefile', '.gradle', '.cmake',
     }
+
+    CODE_EXTS = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.css', '.html', '.htm',
+        '.c', '.cpp', '.cc', '.h', '.hpp', '.cs', '.java', '.kt',
+        '.swift', '.go', '.rs', '.rb', '.php', '.r', '.m', '.scala',
+        '.dart', '.lua', '.pl', '.ex', '.exs', '.vue', '.svelte',
+        '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+        '.sql', '.xml', '.json', '.yaml', '.yml', '.toml',
+    }
+
     if ext in TEXT_EXTS or ext == '':
         try:
-            text = p.read_text(encoding='utf-8', errors='replace')
+            raw = p.read_text(encoding='utf-8', errors='replace')
+            lines = raw.splitlines()
+            total_lines = len(lines)
             lang = ext.lstrip('.') or 'text'
-            return p.name, f"[File: {p.name} ({size:,} bytes)]\n```{lang}\n{text}\n```"
+
+            # ── Add line numbers ──────────────────────────────────────────
+            numbered_lines = []
+            for i, line in enumerate(lines, 1):
+                numbered_lines.append(f"{i:>6} | {line}")
+            numbered_text = "\n".join(numbered_lines)
+
+            # ── Build metadata block ──────────────────────────────────────
+            meta_lines = [
+                f"FILE METADATA",
+                f"  Name       : {p.name}",
+                f"  Size       : {size:,} bytes",
+                f"  Total lines: {total_lines}",
+                f"  Language   : {lang}",
+            ]
+
+            # Code-specific analysis
+            if ext in CODE_EXTS:
+                blank_lines = sum(1 for l in lines if not l.strip())
+                comment_lines = 0
+                functions = []
+                classes = []
+                imports = []
+
+                if ext == '.py':
+                    for i, line in enumerate(lines, 1):
+                        s = line.strip()
+                        if s.startswith('#') or s.startswith('"""') or s.startswith("'''"):
+                            comment_lines += 1
+                        if s.startswith('def ') or s.startswith('async def '):
+                            fname = s.split('(')[0].replace('def ', '').replace('async ', '').strip()
+                            functions.append(f"line {i}: {fname}")
+                        if s.startswith('class '):
+                            cname = s.split('(')[0].split(':')[0].replace('class ', '').strip()
+                            classes.append(f"line {i}: {cname}")
+                        if s.startswith('import ') or s.startswith('from '):
+                            imports.append(f"line {i}: {s[:80]}")
+                elif ext in ('.js', '.ts', '.jsx', '.tsx'):
+                    for i, line in enumerate(lines, 1):
+                        s = line.strip()
+                        if s.startswith('//') or s.startswith('/*') or s.startswith('*'):
+                            comment_lines += 1
+                        if 'function ' in s or s.startswith('const ') and '=>' in s:
+                            functions.append(f"line {i}: {s[:60]}")
+                        if s.startswith('class '):
+                            cname = s.split('{')[0].split('extends')[0].replace('class ', '').strip()
+                            classes.append(f"line {i}: {cname}")
+                        if s.startswith('import ') or s.startswith('require('):
+                            imports.append(f"line {i}: {s[:80]}")
+                elif ext in ('.java', '.cs', '.kt', '.swift'):
+                    for i, line in enumerate(lines, 1):
+                        s = line.strip()
+                        if s.startswith('//') or s.startswith('/*') or s.startswith('*'):
+                            comment_lines += 1
+                        if 'void ' in s or 'public ' in s or 'private ' in s or 'protected ' in s:
+                            if '(' in s and ')' in s and '{' in s:
+                                functions.append(f"line {i}: {s[:60]}")
+                        if s.startswith('class ') or 'class ' in s:
+                            classes.append(f"line {i}: {s[:60]}")
+                        if s.startswith('import ') or s.startswith('using ') or s.startswith('package '):
+                            imports.append(f"line {i}: {s[:80]}")
+                else:
+                    for i, line in enumerate(lines, 1):
+                        s = line.strip()
+                        if s.startswith('#') or s.startswith('//') or s.startswith('/*'):
+                            comment_lines += 1
+
+                meta_lines += [
+                    f"  Code lines : {total_lines - blank_lines - comment_lines}",
+                    f"  Blank lines: {blank_lines}",
+                    f"  Comments   : {comment_lines}",
+                ]
+                if classes:
+                    meta_lines.append(f"\nCLASSES ({len(classes)}):")
+                    meta_lines += [f"    {c}" for c in classes[:50]]
+                if functions:
+                    meta_lines.append(f"\nFUNCTIONS / METHODS ({len(functions)}):")
+                    meta_lines += [f"    {f}" for f in functions[:100]]
+                if imports:
+                    meta_lines.append(f"\nIMPORTS ({len(imports)}):")
+                    meta_lines += [f"    {im}" for im in imports[:50]]
+
+            # For plain text / docs
+            elif ext in ('.txt', '.md', '.markdown', '.rst', '.log'):
+                words = len(raw.split())
+                meta_lines.append(f"  Word count : {words:,}")
+                # Headings for markdown
+                if ext in ('.md', '.markdown', '.rst'):
+                    headings = [(i, l) for i, l in enumerate(lines, 1) if l.startswith('#') or (len(l) > 1 and l[1:].startswith('==') or l[1:].startswith('--'))]
+                    if headings:
+                        meta_lines.append(f"\nHEADINGS / SECTIONS:")
+                        for ln, h in headings[:30]:
+                            meta_lines.append(f"    line {ln}: {h[:80]}")
+
+            meta_block = "\n".join(meta_lines)
+
+            return p.name, (
+                f"=== FILE: {p.name} ===\n"
+                f"{meta_block}\n\n"
+                f"=== FULL CONTENT (with line numbers) ===\n"
+                f"```{lang}\n{numbered_text}\n```"
+            )
         except Exception as e:
             return p.name, f"[Could not read {p.name}: {e}]"
 
     # ── PDF ──────────────────────────────────────────────────────────────
     if ext == '.pdf':
         try:
-            import urllib.request as _ur
-            # Try pypdf / PyPDF2
             try:
                 from pypdf import PdfReader
             except ImportError:
@@ -87,12 +554,29 @@ def _read_file_content(path: str) -> tuple[str, str]:
                     PdfReader = None
             if PdfReader:
                 reader = PdfReader(str(p))
+                total_pages = len(reader.pages)
                 pages = []
-                for i, page in enumerate(reader.pages[:50]):  # cap at 50 pages
-                    pages.append(f"--- Page {i+1} ---\n{page.extract_text() or ''}")
-                text = "\n".join(pages)
-                return p.name, f"[PDF: {p.name}, {len(reader.pages)} pages]\n{text}"
-            return p.name, f"[PDF: {p.name} — install pypdf for text extraction: pip install pypdf]"
+                all_text = []
+                for i, page in enumerate(reader.pages[:100]):
+                    page_text = page.extract_text() or ''
+                    all_text.append(page_text)
+                    pages.append(f"--- Page {i+1} of {total_pages} ---\n{page_text}")
+                full_text = "\n".join(pages)
+                total_words = len(" ".join(all_text).split())
+                total_chars = sum(len(t) for t in all_text)
+                meta = (
+                    f"FILE METADATA\n"
+                    f"  Name       : {p.name}\n"
+                    f"  Size       : {size:,} bytes\n"
+                    f"  Pages      : {total_pages}\n"
+                    f"  Words      : {total_words:,}\n"
+                    f"  Characters : {total_chars:,}\n"
+                )
+                return p.name, (
+                    f"=== FILE: {p.name} ===\n{meta}\n"
+                    f"=== FULL CONTENT ===\n{full_text}"
+                )
+            return p.name, f"[PDF: {p.name} — install pypdf: pip install pypdf]"
         except Exception as e:
             return p.name, f"[PDF read error: {p.name}: {e}]"
 
@@ -102,21 +586,38 @@ def _read_file_content(path: str) -> tuple[str, str]:
             try:
                 from docx import Document
                 doc = Document(str(p))
-                paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
-                text = "\n\n".join(paragraphs)
-                return p.name, f"[Word Document: {p.name}]\n{text}"
+                paragraphs = [(i+1, para.style.name, para.text)
+                              for i, para in enumerate(doc.paragraphs) if para.text.strip()]
+                headings = [(i, style, txt) for i, style, txt in paragraphs
+                            if 'heading' in style.lower() or 'title' in style.lower()]
+                full_text = "\n\n".join(f"[Para {i}] {txt}" for i, _, txt in paragraphs)
+                words = len(" ".join(p[2] for p in paragraphs).split())
+                meta = (
+                    f"FILE METADATA\n"
+                    f"  Name       : {p.name}\n"
+                    f"  Size       : {size:,} bytes\n"
+                    f"  Paragraphs : {len(paragraphs)}\n"
+                    f"  Words      : {words:,}\n"
+                )
+                structure = ""
+                if headings:
+                    structure = "\nDOCUMENT STRUCTURE (headings):\n" + "\n".join(
+                        f"  Para {i}: [{style}] {txt[:100]}" for i, style, txt in headings[:40]
+                    )
+                return p.name, (
+                    f"=== FILE: {p.name} ===\n{meta}{structure}\n\n"
+                    f"=== FULL CONTENT ===\n{full_text}"
+                )
             except ImportError:
-                # Fallback: extract from XML inside .docx (it's a ZIP)
                 import zipfile, xml.etree.ElementTree as ET
                 with zipfile.ZipFile(str(p)) as z:
                     if 'word/document.xml' in z.namelist():
                         xml_content = z.read('word/document.xml').decode('utf-8', errors='replace')
                         root = ET.fromstring(xml_content)
-                        ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
                         texts = [node.text or '' for node in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t')]
                         text = ' '.join(t for t in texts if t.strip())
-                        return p.name, f"[Word Document: {p.name}]\n{text}"
-                return p.name, f"[DOCX: {p.name} — install python-docx for better extraction: pip install python-docx]"
+                        return p.name, f"=== FILE: {p.name} ===\n[Word Document — install python-docx for richer extraction]\n\n{text}"
+                return p.name, f"[DOCX: {p.name} — install python-docx: pip install python-docx]"
         except Exception as e:
             return p.name, f"[DOCX read error: {p.name}: {e}]"
 
@@ -127,6 +628,7 @@ def _read_file_content(path: str) -> tuple[str, str]:
                 import openpyxl
                 wb = openpyxl.load_workbook(str(p), data_only=True)
                 sheets = []
+                total_rows = 0
                 for sheet_name in wb.sheetnames:
                     ws = wb[sheet_name]
                     rows = []
@@ -134,10 +636,34 @@ def _read_file_content(path: str) -> tuple[str, str]:
                         row_vals = [str(c) if c is not None else '' for c in row]
                         if any(v.strip() for v in row_vals):
                             rows.append('\t'.join(row_vals))
+                    total_rows += len(rows)
                     if rows:
-                        sheets.append(f"=== Sheet: {sheet_name} ===\n" + '\n'.join(rows[:500]))
+                        sheets.append(
+                            f"=== Sheet: {sheet_name} ({len(rows)} rows) ===\n"
+                            + '\n'.join(rows[:500])
+                        )
                 text = '\n\n'.join(sheets)
-                return p.name, f"[Excel: {p.name}]\n{text}"
+                meta = (
+                    f"FILE METADATA\n"
+                    f"  Name   : {p.name}\n"
+                    f"  Size   : {size:,} bytes\n"
+                    f"  Sheets : {len(wb.sheetnames)} ({', '.join(wb.sheetnames)})\n"
+                    f"  Rows   : {total_rows:,} total (capped at 500/sheet)\n"
+                )
+                # ── Auto-ingest into Excel Intelligence DB ──────────────────
+                if _excel_intel:
+                    try:
+                        ingest_result = _excel_intel.ingest_workbook(str(p))
+                        sheets_info = ingest_result.get("sheets", [])
+                        for sh in sheets_info:
+                            meta += (
+                                f"\n  ✓ DB stored: sheet '{sh['sheet']}' "
+                                f"({sh['rows']} rows, cols: {', '.join(sh['columns'][:8])})"
+                            )
+                    except Exception as _ei:
+                        meta += f"\n  [Excel DB ingest: {_ei}]"
+                # ── End Excel Intelligence ingest ────────────────────────────────
+                return p.name, f"=== FILE: {p.name} ===\n{meta}\n=== CONTENT ===\n{text}"
             except ImportError:
                 return p.name, f"[Excel: {p.name} — install openpyxl: pip install openpyxl]"
         except Exception as e:
@@ -147,12 +673,14 @@ def _read_file_content(path: str) -> tuple[str, str]:
     IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif'}
     if ext in IMAGE_EXTS:
         try:
-            b64 = base64.b64encode(p.read_bytes()).decode()
             mime = mimetypes.guess_type(str(p))[0] or 'image/png'
             if ext == '.svg':
                 svg_text = p.read_text(encoding='utf-8', errors='replace')
-                return p.name, f"[SVG Image: {p.name}]\n```svg\n{svg_text[:3000]}\n```"
-            return p.name, f"[Image: {p.name} ({mime}, {size:,} bytes)]\n[data:{mime};base64,{b64[:200]}... (image attached, {size:,} bytes)]"
+                return p.name, f"=== FILE: {p.name} ===\n[SVG Image, {size:,} bytes]\n```svg\n{svg_text[:3000]}\n```"
+            return p.name, (
+                f"=== FILE: {p.name} ===\n"
+                f"[Image file: {mime}, {size:,} bytes — binary content not shown as text]"
+            )
         except Exception as e:
             return p.name, f"[Image read error: {p.name}: {e}]"
 
@@ -162,19 +690,28 @@ def _read_file_content(path: str) -> tuple[str, str]:
             if ext == '.zip':
                 with zipfile.ZipFile(str(p)) as z:
                     names = z.namelist()
-                    listing = '\n'.join(names[:100])
-                    return p.name, f"[ZIP Archive: {p.name}, {len(names)} files]\nContents:\n{listing}"
-            return p.name, f"[Archive: {p.name} ({ext}), {size:,} bytes]"
+                    listing = '\n'.join(f"  {n}" for n in names[:200])
+                    return p.name, (
+                        f"=== FILE: {p.name} ===\n"
+                        f"[ZIP Archive, {size:,} bytes, {len(names)} files]\n\n"
+                        f"CONTENTS:\n{listing}"
+                    )
+            return p.name, f"=== FILE: {p.name} ===\n[Archive ({ext}), {size:,} bytes]"
         except Exception as e:
             return p.name, f"[Archive read error: {p.name}: {e}]"
 
     # ── Fallback: binary / unknown ───────────────────────────────────────
     try:
-        # Try reading as text anyway
-        text = p.read_text(encoding='utf-8', errors='replace')[:5000]
-        return p.name, f"[File: {p.name} ({ext}, {size:,} bytes)]\n{text}"
+        raw = p.read_text(encoding='utf-8', errors='replace')
+        lines = raw.splitlines()
+        numbered = "\n".join(f"{i:>6} | {l}" for i, l in enumerate(lines, 1))
+        return p.name, (
+            f"=== FILE: {p.name} ===\n"
+            f"FILE METADATA\n  Name: {p.name}\n  Size: {size:,} bytes\n  Lines: {len(lines)}\n\n"
+            f"=== FULL CONTENT (with line numbers) ===\n{numbered}"
+        )
     except Exception:
-        return p.name, f"[Binary file: {p.name} ({ext}, {size:,} bytes) — content not extractable as text]"
+        return p.name, f"[Binary file: {p.name} ({ext}, {size:,} bytes) — not readable as text]"
 
 
 def _file_icon(path: str) -> str:
@@ -293,13 +830,54 @@ QUICK_COMMANDS = {
         "Show me how to use the /digivalet org-chart lookup command "
         "(e.g. /digivalet Rahul Salgia, /digivalet QA, /digivalet stats)."
     ),
+    "/kb": "/kb list",  # handled locally — shows KB status directly
+    "/excel": ("Show me a summary of all Excel files loaded into your database, "
+               "including sheet names, row counts, and column names. "
+               "Tell me what graphs I can make from this data."),
 }
 
 
-def build_system_prompt(tone: str = "balanced", language: str = "English") -> str:
+def build_system_prompt(tone: str = "balanced", language: str = "English",
+                        kb=None, include_programming_kb: bool = True,
+                        org_tree=None, excel_intel=None) -> str:
+    """Build the full Ollama system prompt with all knowledge sources merged."""
     base = BASE_PERSONALITY.get(tone, BASE_PERSONALITY["balanced"])
     addon = LANGUAGE_ADDONS.get(language, "")
-    return base + ("\n" + addon if addon else "")
+    prompt = base + ("\n" + addon if addon else "")
+    if kb is not None and not kb.is_empty():
+        prompt += "\n\n" + kb.system_prompt_block()
+    if org_tree is not None and org_tree.loaded:
+        snippet = org_tree.to_context_snippet(max_rows=200)
+        if snippet:
+            prompt += "\n\n# Employee Directory (answer org-chart questions from this)\n" + snippet
+    if excel_intel is not None and excel_intel.has_data():
+        prompt += excel_intel.build_excel_context()
+    if PROGRAMMING_KNOWLEDGE and include_programming_kb:
+        prompt += "\n\n" + PROGRAMMING_KNOWLEDGE
+    return prompt
+
+
+_CODE_FENCE_RE = re.compile(r"```")
+
+
+def _message_likely_contains_code(text: str) -> bool:
+    """Heuristic: does this user message carry an actual code paste or
+    file attachment that the model should focus on, rather than a
+    generic 'how do I do X' syntax question?"""
+    if not text:
+        return False
+    if _CODE_FENCE_RE.search(text):
+        return True
+    if "**Attached files for context:**" in text:
+        return True
+    # A handful of lines with classic code punctuation/indentation is a
+    # decent signal even without fences.
+    code_hint_lines = sum(
+        1 for line in text.splitlines()
+        if line.strip() and (line.startswith((" ", "\t"))
+                              or any(tok in line for tok in ("def ", "class ", "import ", "{", "}", ";")))
+    )
+    return code_hint_lines >= 3
 
 
 # ─── Ollama Worker Thread ──────────────────────────────────────────────────────
@@ -323,7 +901,14 @@ class OllamaWorker(QObject):
         payload = json.dumps({
             "model": self.model,
             "messages": self.messages,
-            "stream": True
+            "stream": True,
+            # Ollama defaults to a tiny 2048-token context unless told
+            # otherwise. With a large system prompt (knowledge base) plus
+            # pasted/attached code, that default silently truncates the
+            # user's actual code out of the context — which is why the
+            # model can "forget" code that was just sent. Force a much
+            # larger window so real-world code pastes survive.
+            "options": {"num_ctx": 8192}
         }).encode()
 
         try:
@@ -350,9 +935,13 @@ class OllamaWorker(QObject):
                     except json.JSONDecodeError:
                         pass
         except urllib.error.URLError as e:
-            self.error.emit(f"Cannot connect to Ollama.\n\nMake sure Ollama is running:\n  ollama serve\n\nError: {e.reason}")
+            if not self._cancelled:
+                self.error.emit(
+                    f"Cannot connect to Ollama.\n\nMake sure Ollama is running:\n  ollama serve\n\nError: {e.reason}"
+                )
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
         finally:
             self.finished.emit()
 
@@ -388,11 +977,15 @@ def markdown_to_html(text: str, dark_mode: bool = True) -> str:
     quote_fg = "#8a7a6a" if dark_mode else "#6a5a4a"
 
     def replace_code_block(m):
+        lang = m.group(1).strip()
         code = m.group(2).strip()
+        # Unescape HTML entities inside code blocks so code renders correctly
+        code = code.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        lang_label = f'<span style="color:{header_color};font-size:9px;opacity:0.7;">{lang}</span><br>' if lang else ""
         return (
             f'<div style="background:{code_bg};border:1px solid #3a3028;border-left:3px solid {header_color};'
             f'border-radius:6px;padding:8px 12px;margin:6px 0;font-family:monospace;font-size:11px;'
-            f'color:{code_fg};white-space:pre-wrap;">{code}</div>'
+            f'color:{code_fg};white-space:pre-wrap;">{lang_label}{code}</div>'
         )
     text = re.sub(r'```(\w*)\n(.*?)```', replace_code_block, text, flags=re.DOTALL)
 
@@ -878,65 +1471,120 @@ def _detect_code_blocks(text: str) -> list[tuple[str, str]]:
 # ─── File Chip Widget ─────────────────────────────────────────────────────────
 
 class FileChip(QFrame):
-    """Small removable chip showing an attached file."""
+    """Gemini-style attachment card: icon swatch + filename, with a small
+    circular remove button. Fixed compact size so a row of attachments
+    stays tidy and doesn't crowd the input bar."""
     removed = Signal(str)  # emits file path
+
+    CARD_WIDTH = 168
+    CARD_HEIGHT = 52
 
     def __init__(self, file_path: str, parent=None):
         super().__init__(parent)
         self._path = file_path
         self.setObjectName("fileChip")
-        self.setFixedHeight(32)
+        self.setFixedSize(self.CARD_WIDTH, self.CARD_HEIGHT)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 0, 6, 0)
-        layout.setSpacing(5)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
 
-        icon = QLabel(_file_icon(file_path))
-        icon.setFont(QFont("Segoe UI Emoji", 12))
-        layout.addWidget(icon)
+        # Icon swatch — small rounded square, like Gemini's file-type tile
+        swatch = QLabel(_file_icon(file_path))
+        swatch.setObjectName("fileChipSwatch")
+        swatch.setFixedSize(36, 36)
+        swatch.setAlignment(Qt.AlignCenter)
+        swatch.setFont(QFont("Segoe UI Emoji", 14))
+        outer.addWidget(swatch)
+
+        # Name + type, stacked
+        text_col = QVBoxLayout()
+        text_col.setSpacing(1)
+        text_col.setContentsMargins(0, 0, 0, 0)
 
         name = Path(file_path).name
-        short_name = name[:18] + "…" if len(name) > 20 else name
-        name_lbl = QLabel(short_name)
+        stem, ext = Path(file_path).stem, Path(file_path).suffix.lstrip(".").upper()
+        short_stem = stem if len(stem) <= 16 else stem[:15] + "…"
+        name_lbl = QLabel(short_stem)
+        name_lbl.setObjectName("fileChipName")
         name_lbl.setFont(QFont("Georgia", 9))
-        name_lbl.setToolTip(file_path)
-        layout.addWidget(name_lbl)
+        name_lbl.setToolTip(name)
+        text_col.addWidget(name_lbl)
 
+        type_lbl = QLabel(ext or "FILE")
+        type_lbl.setObjectName("fileChipType")
+        type_lbl.setFont(QFont("Georgia", 8))
+        text_col.addWidget(type_lbl)
+
+        outer.addLayout(text_col, 1)
+
+        # Remove button — small circle, top-right
         remove_btn = QPushButton("✕")
-        remove_btn.setFixedSize(16, 16)
+        remove_btn.setObjectName("fileChipRemove")
+        remove_btn.setFixedSize(18, 18)
         remove_btn.setFont(QFont("Georgia", 8))
         remove_btn.setCursor(Qt.PointingHandCursor)
+        remove_btn.setToolTip("Remove")
         remove_btn.clicked.connect(lambda: self.removed.emit(self._path))
-        layout.addWidget(remove_btn)
+        outer.addWidget(remove_btn, 0, Qt.AlignTop)
 
         self._apply_style()
 
     def _apply_style(self):
         if _DARK_MODE:
             self.setStyleSheet("""
-                QFrame#fileChip { background:#1e1a16; border:1px solid #3a3028;
-                                   border-radius:16px; }
-                QLabel { color:#c8a96e; background:transparent; }
-                QPushButton { background:transparent; color:#5a4a38; border:none;
-                               border-radius:8px; font-size:9px; }
-                QPushButton:hover { color:#e07070; background:#2a2420; }
+                QFrame#fileChip { background:#181410; border:1px solid #2a2420;
+                                   border-radius:12px; }
+                QLabel#fileChipSwatch { background:#241e16; border-radius:8px;
+                                          color:#c8a96e; }
+                QLabel#fileChipName { color:#d4cfc8; background:transparent; }
+                QLabel#fileChipType { color:#5c5046; background:transparent;
+                                        letter-spacing:1px; }
+                QPushButton#fileChipRemove { background:#241e16; color:#5a4a38;
+                                               border:none; border-radius:9px; }
+                QPushButton#fileChipRemove:hover { color:#e07070; background:#2a2420; }
             """)
         else:
             self.setStyleSheet("""
-                QFrame#fileChip { background:#fff8ec; border:1px solid #d0b870;
-                                   border-radius:16px; }
-                QLabel { color:#8b6914; background:transparent; }
-                QPushButton { background:transparent; color:#c0a870; border:none;
-                               border-radius:8px; font-size:9px; }
-                QPushButton:hover { color:#c04040; background:#f0e0b0; }
+                QFrame#fileChip { background:#ffffff; border:1px solid #e0d8c4;
+                                   border-radius:12px; }
+                QLabel#fileChipSwatch { background:#fff0cc; border-radius:8px;
+                                          color:#8b6914; }
+                QLabel#fileChipName { color:#2a2010; background:transparent; }
+                QLabel#fileChipType { color:#9a8a70; background:transparent;
+                                        letter-spacing:1px; }
+                QPushButton#fileChipRemove { background:#f0e8d0; color:#a09070;
+                                               border:none; border-radius:9px; }
+                QPushButton#fileChipRemove:hover { color:#c04040; background:#f8d8d8; }
             """)
 
 
 # ─── Custom Input Box ─────────────────────────────────────────────────────────
 
 class SmartTextEdit(QTextEdit):
-    """Custom QTextEdit: Enter sends, Shift+Enter inserts newline."""
+    """Custom QTextEdit: Enter sends, Shift+Enter inserts newline.
+
+    Gemini-style auto-grow: starts as a compact single line and only
+    expands as the user types more, capped at MAX_HEIGHT. Resizing is
+    debounced with a single-shot QTimer so rapid keystrokes don't trigger
+    a relayout on every character — keeps it smooth and lag-free.
+    """
     send_requested = Signal()
+
+    MIN_HEIGHT = 44
+    MAX_HEIGHT = 160
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(0)  # coalesce same-frame changes
+        self._resize_timer.timeout.connect(self._apply_auto_height)
+        self.document().contentsChanged.connect(self._schedule_resize)
+        # Lock height immediately so nothing can stretch this box before
+        # the first resize pass runs.
+        self.setFixedHeight(self.MIN_HEIGHT)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -946,6 +1594,43 @@ class SmartTextEdit(QTextEdit):
                 self.send_requested.emit()
         else:
             super().keyPressEvent(event)
+
+    def _schedule_resize(self):
+        if not self._resize_timer.isActive():
+            self._resize_timer.start()
+
+    def _apply_auto_height(self):
+        doc_height = int(self.document().size().height())
+        if doc_height <= 0:
+            doc_height = self.MIN_HEIGHT
+        margins = self.contentsMargins()
+        target = doc_height + margins.top() + margins.bottom() + 12
+        target = max(self.MIN_HEIGHT, min(target, self.MAX_HEIGHT))
+        if target != self.height():
+            self.setFixedHeight(target)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if doc_height > self.MAX_HEIGHT else Qt.ScrollBarAlwaysOff
+        )
+
+    def clear(self):
+        super().clear()
+        self._apply_auto_height()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        pill = self.parentWidget()
+        if pill is not None:
+            pill.setProperty("focused", True)
+            pill.style().unpolish(pill)
+            pill.style().polish(pill)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        pill = self.parentWidget()
+        if pill is not None:
+            pill.setProperty("focused", False)
+            pill.style().unpolish(pill)
+            pill.style().polish(pill)
 
 
 # ─── Splash / Welcome Screen ───────────────────────────────────────────────────
@@ -1015,8 +1700,6 @@ class ImageLaunchButton(QPushButton):
     def _set_glow(self, v):
         self._glow = v
         self.update()
-    glowValue = property(_get_glow, _set_glow)
-    # Make it a Qt property
     from PySide6.QtCore import Property as _Prop
     glowValue = _Prop(float, _get_glow, _set_glow)
 
@@ -1484,7 +2167,6 @@ class SplashScreen(QWidget):
         self._pulse_anim.setEndValue(0.30)
         self._pulse_anim.setDuration(1300)
         self._pulse_anim.setEasingCurve(QEasingCurve.InOutSine)
-        self._pulse_anim.setLoopCount(-1)
         self._pulse_anim.finished.connect(self._flip_pulse)
         self._pulse_anim.start()
 
@@ -1813,13 +2495,17 @@ QFrame#userBubble { background-color: #111820; border: 1px solid #1e2a38; border
 QFrame#typingIndicator { background-color: #181410; border: 1px solid #2a2420; border-left: 3px solid #c8a96e; border-radius: 10px; margin: 3px 60px 3px 0px; }
 QLabel#msgText { color: #d4cfc8; line-height: 1.6; background: transparent; }
 QLabel#timeLabel { color: #3a3028; }
-QWidget#inputArea { background-color: #0e0c0a; border-top: 1px solid #1e1a16; }
-QTextEdit#inputBox { background-color: #161210; color: #d4cfc8; border: 1px solid #2a2420; border-radius: 10px; padding: 10px 14px; font-size: 13px; selection-background-color: #3a3028; }
-QTextEdit#inputBox:focus { border-color: #c8a96e; background-color: #1a1612; }
-QPushButton#sendBtn { background-color: #c8a96e; color: #0e0c0a; border: none; border-radius: 10px; font-size: 18px; font-weight: bold; min-width: 48px; min-height: 48px; max-width: 48px; max-height: 48px; }
+QWidget#inputArea { background-color: #0e0c0a; }
+QWidget#inputRow { background-color: #161210; border: 1px solid #2a2420; border-radius: 22px; }
+QWidget#inputRow[focused="true"] { border-color: #c8a96e; background-color: #1a1612; }
+QTextEdit#inputBox { background-color: transparent; color: #d4cfc8; border: none; padding: 9px 4px; font-size: 13px; selection-background-color: #3a3028; }
+QPushButton#sendBtn { background-color: #c8a96e; color: #0e0c0a; border: none; border-radius: 20px; font-size: 16px; font-weight: bold; min-width: 40px; min-height: 40px; max-width: 40px; max-height: 40px; }
 QPushButton#sendBtn:hover { background-color: #dbbf82; }
 QPushButton#sendBtn:disabled { background-color: #2a2420; color: #4a4038; }
-QPushButton#stopBtn { background-color: #3a1818; color: #e07070; border: 1px solid #5a2828; border-radius: 10px; font-size: 12px; min-width: 48px; min-height: 48px; max-width: 48px; max-height: 48px; }
+QPushButton#attachBtn { background-color: transparent; color: #c8a96e; border: none; border-radius: 20px; font-size: 16px; font-weight: bold; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
+QPushButton#attachBtn:hover { background-color: #2a2420; }
+QPushButton#attachBtn[hasFiles="true"] { background-color: #2a2015; color: #e8c97e; }
+QPushButton#stopBtn { background-color: #3a1818; color: #e07070; border: none; border-radius: 20px; font-size: 12px; min-width: 40px; min-height: 40px; max-width: 40px; max-height: 40px; }
 QPushButton#stopBtn:hover { background-color: #4a2020; }
 QLabel#statusLabel { color: #4a4038; font-size: 10px; letter-spacing: 1px; }
 QPushButton#copyBtn { background: transparent; color: #4a4038; border: none; border-radius: 4px; font-size: 12px; padding: 0px; }
@@ -1876,13 +2562,17 @@ QFrame#userBubble { background-color: #eaf4fb; border: 1px solid #c0d8e8; border
 QFrame#typingIndicator { background-color: #fff8ec; border: 1px solid #d0c8b0; border-left: 3px solid #c8a96e; border-radius: 10px; margin: 3px 60px 3px 0px; }
 QLabel#msgText { color: #2a2010; line-height: 1.6; background: transparent; }
 QLabel#timeLabel { color: #c0b090; }
-QWidget#inputArea { background-color: #f5f0e8; border-top: 1px solid #d8d0c0; }
-QTextEdit#inputBox { background-color: #fff8ec; color: #2a2010; border: 1px solid #d0c8b0; border-radius: 10px; padding: 10px 14px; font-size: 13px; selection-background-color: #f0d890; }
-QTextEdit#inputBox:focus { border-color: #c8a96e; background-color: #fffdf5; }
-QPushButton#sendBtn { background-color: #c8a96e; color: #fff8ec; border: none; border-radius: 10px; font-size: 18px; font-weight: bold; min-width: 48px; min-height: 48px; max-width: 48px; max-height: 48px; }
+QWidget#inputArea { background-color: #f5f0e8; }
+QWidget#inputRow { background-color: #ffffff; border: 1px solid #d8d0c0; border-radius: 22px; }
+QWidget#inputRow[focused="true"] { border-color: #c8a96e; background-color: #fffdf5; }
+QTextEdit#inputBox { background-color: transparent; color: #2a2010; border: none; padding: 9px 4px; font-size: 13px; selection-background-color: #f0d890; }
+QPushButton#sendBtn { background-color: #c8a96e; color: #fff8ec; border: none; border-radius: 20px; font-size: 16px; font-weight: bold; min-width: 40px; min-height: 40px; max-width: 40px; max-height: 40px; }
 QPushButton#sendBtn:hover { background-color: #dbbf82; }
 QPushButton#sendBtn:disabled { background-color: #d8d0c0; color: #a09080; }
-QPushButton#stopBtn { background-color: #fce8e8; color: #c04040; border: 1px solid #e0b0b0; border-radius: 10px; font-size: 12px; min-width: 48px; min-height: 48px; max-width: 48px; max-height: 48px; }
+QPushButton#attachBtn { background-color: transparent; color: #8b6914; border: none; border-radius: 20px; font-size: 16px; font-weight: bold; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
+QPushButton#attachBtn:hover { background-color: #f0e8d0; }
+QPushButton#attachBtn[hasFiles="true"] { background-color: #fff0cc; color: #7a5900; }
+QPushButton#stopBtn { background-color: #fce8e8; color: #c04040; border: none; border-radius: 20px; font-size: 12px; min-width: 40px; min-height: 40px; max-width: 40px; max-height: 40px; }
 QPushButton#stopBtn:hover { background-color: #f8d8d8; }
 QLabel#statusLabel { color: #b0a080; font-size: 10px; letter-spacing: 1px; }
 QPushButton#copyBtn { background: transparent; color: #b0a080; border: none; border-radius: 4px; font-size: 12px; padding: 0px; }
@@ -1958,9 +2648,22 @@ class DigiValetWindow(QMainWindow):
         self._attached_files: list = []   # list of file paths pending send
         self._file_chips: dict = {}       # path → FileChip widget
 
+        # ── Scroll behaviour ────────────────────────────────────────────
+        # True = keep following the bottom during generation.
+        # Flips to False the moment the user drags the scrollbar up.
+        # Resets to True when the user sends a new message.
+        self._auto_scroll: bool = True
+
         # ── Org Tree (offline org-chart lookup) ────────────────────────
         self.org_tree = OrgTree()
         self._load_org_tree()
+
+        # ── Persistent Knowledge Base ───────────────────────────────
+        self.kb = KnowledgeBase() if KnowledgeBase else None
+        if self.kb and not self.kb.is_empty():
+            files = self.kb.list_files()
+            print(f"📚 Knowledge base loaded: {len(files)} file(s) — "
+                  + ", ".join(f['filename'] for f in files))
 
         self._transition_active = False
         self._reveal = None
@@ -1990,9 +2693,11 @@ class DigiValetWindow(QMainWindow):
     # ── Org Tree ───────────────────────────────────────────────────────────
 
     def _load_org_tree(self):
-        """Locate and load OrgTree.csv from a few common locations."""
+        """Locate and load OrgTree.csv from several common locations."""
+        import sys as _sys
         candidates = [
             Path(__file__).resolve().parent / "OrgTree.csv",
+            Path(_sys.argv[0]).resolve().parent / "OrgTree.csv",
             Path.cwd() / "OrgTree.csv",
             Path.home() / "OrgTree.csv",
             Path.home() / ".digi_valet_orgtree.csv",
@@ -2369,92 +3074,147 @@ class DigiValetWindow(QMainWindow):
         self.chat_layout.addStretch()
 
         self.scroll_area.setWidget(self.chat_container)
-        chat_layout.addWidget(self.scroll_area)
+        chat_layout.addWidget(self.scroll_area, 1)
 
-        chat_layout.addWidget(self._build_input_area())
+        # Detect when user manually scrolls up — pause auto-scroll
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
+
+        chat_layout.addWidget(self._build_input_area(), 0)
         return chat_area
 
     def _build_input_area(self):
-        # Outer wrapper — variable height to accommodate file chips
+        # Outer wrapper — height is driven entirely by its children
+        # (chips strip + pill), and locked with a vertical size policy of
+        # Fixed/Minimum so leftover layout space never stretches it.
         outer = QWidget()
         outer.setObjectName("inputArea")
+        outer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         outer_layout = QVBoxLayout(outer)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
+        outer_layout.setContentsMargins(16, 8, 16, 14)
+        outer_layout.setSpacing(8)
 
         # ── File chips strip (hidden when no files attached) ─────────────
         self._chips_bar = QWidget()
         self._chips_bar.setObjectName("chipsBar")
+        self._chips_bar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._chips_bar.setFixedHeight(FileChip.CARD_HEIGHT)
         self._chips_layout = QHBoxLayout(self._chips_bar)
-        self._chips_layout.setContentsMargins(20, 6, 20, 0)
-        self._chips_layout.setSpacing(6)
+        self._chips_layout.setContentsMargins(0, 0, 0, 0)
+        self._chips_layout.setSpacing(8)
         self._chips_layout.addStretch()
         self._chips_bar.hide()
         outer_layout.addWidget(self._chips_bar)
 
-        # ── Input row ────────────────────────────────────────────────────
+        # ── Input row (compact, Gemini-style pill bar) ─────────────────────
         input_row = QWidget()
         input_row.setObjectName("inputRow")
+        input_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         layout = QHBoxLayout(input_row)
-        layout.setContentsMargins(20, 10, 20, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 6, 8, 6)
+        layout.setSpacing(6)
+        layout.setAlignment(Qt.AlignVCenter)
 
         # ── Attach button (Gemini-style) ─────────────────────────────────
         self.attach_btn = QPushButton("+")
         self.attach_btn.setObjectName("attachBtn")
-        self.attach_btn.setFont(QFont("Georgia", 20, QFont.Bold))
-        self.attach_btn.setFixedSize(44, 44)
-        self.attach_btn.setToolTip("Attach files (any type, any size)")
+        self.attach_btn.setFont(QFont("Georgia", 15, QFont.Bold))
+        self.attach_btn.setFixedSize(40, 40)
+        self.attach_btn.setToolTip("Attach files (any type, up to 100 files / 10 GB)")
         self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.clicked.connect(self._pick_files)
-        layout.addWidget(self.attach_btn)
+        layout.addWidget(self.attach_btn, 0, Qt.AlignBottom)
 
         self.input_box = SmartTextEdit()
         self.input_box.setObjectName("inputBox")
         self.input_box.setFont(QFont("Georgia", 11))
-        self.input_box.setPlaceholderText("Ask Digi Valet anything…  (Enter to send, Shift+Enter for new line, + to attach files)")
-        self.input_box.setFixedHeight(70)
-        self.input_box.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.input_box.setPlaceholderText("Ask Digi Valet anything…")
         self.input_box.send_requested.connect(self._send_message)
         layout.addWidget(self.input_box)
 
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(4)
-
         self.send_btn = QPushButton("↑")
         self.send_btn.setObjectName("sendBtn")
-        self.send_btn.setFont(QFont("Georgia", 18, QFont.Bold))
+        self.send_btn.setFont(QFont("Georgia", 16, QFont.Bold))
+        self.send_btn.setFixedSize(40, 40)
         self.send_btn.setToolTip("Send (Enter)")
         self.send_btn.clicked.connect(self._send_message)
-        btn_col.addWidget(self.send_btn)
+        layout.addWidget(self.send_btn, 0, Qt.AlignBottom)
 
         self.stop_btn = QPushButton("■")
         self.stop_btn.setObjectName("stopBtn")
         self.stop_btn.setFont(QFont("Georgia", 12))
+        self.stop_btn.setFixedSize(40, 40)
         self.stop_btn.setToolTip("Stop generation")
         self.stop_btn.clicked.connect(self._stop_generation)
         self.stop_btn.hide()
-        btn_col.addWidget(self.stop_btn)
+        layout.addWidget(self.stop_btn, 0, Qt.AlignBottom)
 
-        layout.addLayout(btn_col)
+        # Hard cap: belt-and-suspenders safety net on top of the Fixed
+        # size policies above, so this area can never be stretched by a
+        # parent layout — chips strip + pill + outer margins, no more.
+        input_row.setMaximumHeight(SmartTextEdit.MAX_HEIGHT + 12)
         outer_layout.addWidget(input_row)
+        margins = outer_layout.contentsMargins()
+        outer.setMaximumHeight(
+            self._chips_bar.maximumHeight()
+            + input_row.maximumHeight()
+            + outer_layout.spacing()
+            + margins.top() + margins.bottom()
+        )
         return outer
 
     # ── File attachment logic ──────────────────────────────────────────────
 
+    # ── Limits ──────────────────────────────────────────────────────────────
+    _MAX_FILES = 100
+    _MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
+
     def _pick_files(self):
-        """Open a file dialog — any type, any number."""
+        """Open a file dialog — any type, up to 100 files / 10 GB total."""
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Attach files — any type supported",
+            "Attach files — any type, up to 100 files / 10 GB total",
             str(Path.home()),
             "All Files (*.*)"
         )
+        skipped_dup = 0
+        skipped_limit = 0
+        skipped_size = 0
+
+        current_total = sum(
+            Path(p).stat().st_size for p in self._attached_files if Path(p).exists()
+        )
+
         for path in paths:
-            if path and path not in self._attached_files:
-                self._attached_files.append(path)
-                self._add_chip(path)
+            if not path:
+                continue
+            if path in self._attached_files:
+                skipped_dup += 1
+                continue
+            if len(self._attached_files) >= self._MAX_FILES:
+                skipped_limit += 1
+                continue
+            try:
+                file_size = Path(path).stat().st_size
+            except OSError:
+                file_size = 0
+            if current_total + file_size > self._MAX_TOTAL_BYTES:
+                skipped_size += 1
+                continue
+            self._attached_files.append(path)
+            self._add_chip(path)
+            current_total += file_size
+
         self._refresh_chips_bar()
+        self._update_attach_badge()
+
+        # Friendly warnings
+        msgs = []
+        if skipped_limit:
+            msgs.append(f"{skipped_limit} file(s) skipped — 100-file limit reached.")
+        if skipped_size:
+            msgs.append(f"{skipped_size} file(s) skipped — 10 GB total size limit reached.")
+        if msgs:
+            QMessageBox.warning(self, "Attachment Limit", "\n".join(msgs))
 
     def _add_chip(self, path: str):
         chip = FileChip(path)
@@ -2472,9 +3232,26 @@ class DigiValetWindow(QMainWindow):
             self._chips_layout.removeWidget(chip)
             chip.deleteLater()
         self._refresh_chips_bar()
+        self._update_attach_badge()
 
     def _refresh_chips_bar(self):
         self._chips_bar.setVisible(bool(self._attached_files))
+
+    def _update_attach_badge(self):
+        """Show file count on the attach button; revert to '+' when empty."""
+        n = len(self._attached_files)
+        if n == 0:
+            self.attach_btn.setText("+")
+            self.attach_btn.setToolTip("Attach files (any type, up to 100 files / 10 GB)")
+        else:
+            self.attach_btn.setText(f"+{n}")
+            size_mb = sum(
+                Path(p).stat().st_size for p in self._attached_files if Path(p).exists()
+            ) / (1024 * 1024)
+            size_str = f"{size_mb:.1f} MB" if size_mb < 1024 else f"{size_mb/1024:.2f} GB"
+            self.attach_btn.setToolTip(
+                f"{n} file(s) attached ({size_str}) — click to add more"
+            )
 
     # ── Theme ──────────────────────────────────────────────────────────────
 
@@ -2501,6 +3278,9 @@ class DigiValetWindow(QMainWindow):
             w = self.chat_layout.itemAt(i).widget()
             if isinstance(w, MessageBubble):
                 w._render(w._raw_text)
+        # Re-theme any attached file cards
+        for chip in self._file_chips.values():
+            chip._apply_style()
 
     # ── Privacy Mode ───────────────────────────────────────────────────────
 
@@ -2530,10 +3310,13 @@ class DigiValetWindow(QMainWindow):
         self._save_prefs()
         self._refresh_system_prompt()
 
-    def _refresh_system_prompt(self):
+    def _refresh_system_prompt(self, include_programming_kb: bool = True):
         tone = self._prefs.get("tone", "balanced")
         language = self._prefs.get("language", "English")
-        new_prompt = build_system_prompt(tone, language)
+        new_prompt = build_system_prompt(
+            tone, language, kb=self.kb, include_programming_kb=include_programming_kb,
+            org_tree=self.org_tree, excel_intel=_excel_intel
+        )
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = new_prompt
         if self.current_chat_id and self.current_chat_id in self.all_chats:
@@ -2541,14 +3324,21 @@ class DigiValetWindow(QMainWindow):
             if not self.privacy_mode:
                 self._save_all_chats()
 
-    def _get_system_prompt(self) -> str:
+    def _get_system_prompt(self, include_programming_kb: bool = True) -> str:
         tone = self._prefs.get("tone", "balanced")
         language = self._prefs.get("language", "English")
-        return build_system_prompt(tone, language)
+        return build_system_prompt(
+            tone, language, kb=self.kb, include_programming_kb=include_programming_kb,
+            org_tree=self.org_tree, excel_intel=_excel_intel
+        )
 
     # ── Quick Commands ─────────────────────────────────────────────────────
 
     def _run_quick_command(self, cmd: str):
+        if cmd == "/kb":
+            self.input_box.setPlainText("/kb list")
+            self._send_message()
+            return
         if cmd == "/digivalet":
             self.input_box.setPlainText("/digivalet help")
             self._send_message()
@@ -2566,32 +3356,58 @@ class DigiValetWindow(QMainWindow):
     # ── /digivalet org-chart command ─────────────────────────────────────
 
     def _handle_digivalet_command(self, text: str) -> str:
-        """Return a markdown answer for a '/digivalet ...' command using OrgTree.csv."""
+        """Return a markdown answer for a /digivalet command using the embedded OrgTree."""
         query = text[len("/digivalet"):].strip()
+        ql = query.lower()
 
         if not self.org_tree.loaded:
             return (
                 "⚠️ The org tree hasn't been loaded yet.\n\n"
-                "Place an **OrgTree.csv** file (columns: `Employee Number, Display Name, "
+                "Place **OrgTree.csv** (columns: `Employee Number, Display Name, "
                 "Job Title, Department, Location, Reportees Count`) next to "
-                "`digi_valet_chat.py`, or in your home directory as "
-                "`OrgTree.csv` / `.digi_valet_orgtree.csv`, then restart Digi Valet."
+                "`digi_valet_chat.py` and restart, or use `/digivalet reload`."
             )
 
-        if not query or query.lower() in ("help", "?"):
+        # ── reload ─────────────────────────────────────────────────────────
+        if ql == "reload":
+            self._load_org_tree()
+            if self.org_tree.loaded:
+                return f"✓ OrgTree reloaded — {len(self.org_tree.employees)} employees."
+            return "⚠️ Reload failed — OrgTree.csv not found."
+
+        # ── export ─────────────────────────────────────────────────────────
+        if ql == "export":
+            import csv as _csv
+            out = Path.home() / "digi_valet_org_export.csv"
+            try:
+                with open(out, 'w', newline='', encoding='utf-8') as f:
+                    w = _csv.DictWriter(f, fieldnames=['emp_number','name','title','dept','location','reports_count'])
+                    w.writeheader()
+                    w.writerows(self.org_tree.employees.values())
+                return f"✓ Exported {len(self.org_tree.employees)} employees to `{out}`"
+            except Exception as e:
+                return f"⚠️ Export failed: {e}"
+
+        # ── help / empty ────────────────────────────────────────────────────
+        if not query or ql in ("help", "?"):
             stats = self.org_tree.stats()
             dept_lines = "\n".join(f"  • {d}: {c}" for d, c in list(stats["departments"].items())[:10])
             return (
                 f"**Digi Valet Org Lookup** — {stats['total']} employees loaded\n\n"
-                "Usage:\n"
-                "• `/digivalet <name>` — show an employee's details (e.g. `/digivalet Rahul Salgia`)\n"
-                "• `/digivalet <employee number>` — e.g. `/digivalet PB001`\n"
-                "• `/digivalet <keyword>` — search title/department/location (e.g. `/digivalet QA`, `/digivalet Indore`)\n"
-                "• `/digivalet stats` — overview of departments and locations\n\n"
+                "**Commands:**\n"
+                "• `/digivalet <name>` — employee profile\n"
+                "• `/digivalet <emp number>` — e.g. `/digivalet PB001`\n"
+                "• `/digivalet <keyword>` — search across all fields\n"
+                "• `/digivalet dept:<name>` — list by department\n"
+                "• `/digivalet loc:<city>` — list by location\n"
+                "• `/digivalet stats` — org overview\n"
+                "• `/digivalet reload` — hot-reload OrgTree.csv\n"
+                "• `/digivalet export` — export all employees to CSV\n\n"
                 f"Top departments:\n{dept_lines}"
             )
 
-        if query.lower() == "stats":
+        # ── stats ──────────────────────────────────────────────────────────
+        if ql == "stats":
             stats = self.org_tree.stats()
             dept_lines = "\n".join(f"| {d} | {c} |" for d, c in stats["departments"].items())
             loc_lines = "\n".join(f"| {l} | {c} |" for l, c in stats["locations"].items())
@@ -2601,17 +3417,38 @@ class DigiValetWindow(QMainWindow):
                 f"**By Location**\n\n| Location | Count |\n|---|---|\n{loc_lines}"
             )
 
-        # Exact match on employee number or full name first
+        # ── dept: filter ────────────────────────────────────────────────────
+        if ql.startswith("dept:"):
+            dept_name = query[5:].strip()
+            results = self.org_tree.list_by_department(dept_name, limit=50)
+            if not results:
+                return f"No employees found in department **'{dept_name}'**."
+            return (
+                f"**{len(results)} employee(s) in '{dept_name}':**\n\n"
+                + self.org_tree.format_results_table(results)
+            )
+
+        # ── loc: filter ─────────────────────────────────────────────────────
+        if ql.startswith("loc:"):
+            loc_name = query[4:].strip()
+            results = self.org_tree.list_by_location(loc_name, limit=50)
+            if not results:
+                return f"No employees found at location **'{loc_name}'**."
+            return (
+                f"**{len(results)} employee(s) at '{loc_name}':**\n\n"
+                + self.org_tree.format_results_table(results)
+            )
+
+        # ── exact match (name or emp number) ────────────────────────────────
         emp = self.org_tree.get_employee(query)
         if emp:
             return self.org_tree.format_employee(emp)
 
-        # Otherwise, fuzzy search across name/title/dept/location
+        # ── full-text search ─────────────────────────────────────────────────
         results = self.org_tree.search(query)
         if not results:
             return f"No matches found in the org tree for **'{query}'**."
-        header = f"Found {len(results)} match(es) for **'{query}'**:\n\n"
-        return header + self.org_tree.format_results_table(results)
+        return f"Found **{len(results)}** match(es) for **'{query}'**:\n\n" + self.org_tree.format_results_table(results)
 
     # ── State and History ──────────────────────────────────────────────────
 
@@ -2734,6 +3571,44 @@ class DigiValetWindow(QMainWindow):
         if not text:
             return
         if self.current_thread and self.current_thread.isRunning():
+            self._add_system_notice("⏳ Please wait for the current response to finish.")
+            return
+
+        # Resume auto-scroll on every new message
+        self._auto_scroll = True
+
+        # ── /excel command: answer locally ─────────────────────────────────
+        if text.lower().startswith("/excel"):
+            self.input_box.clear()
+            user_bubble = MessageBubble(text, "user")
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, user_bubble)
+            answer = self._handle_excel_command(text)
+            reply_bubble = MessageBubble(answer, "assistant")
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, reply_bubble)
+            self._scroll_to_bottom()
+            self.messages.append({"role": "user", "content": text})
+            self.messages.append({"role": "assistant", "content": answer})
+            self.all_chats[self.current_chat_id]["messages"] = self.messages
+            self._populate_sidebar_list()
+            if not self.privacy_mode:
+                self._save_all_chats()
+            return
+
+        # ── /kb knowledge-base command: answer locally, no LLM call ────
+        if text.lower().startswith("/kb"):
+            self.input_box.clear()
+            user_bubble = MessageBubble(text, "user")
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, user_bubble)
+            answer = self._handle_kb_command(text)
+            reply_bubble = MessageBubble(answer, "assistant")
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, reply_bubble)
+            self._scroll_to_bottom()
+            self.messages.append({"role": "user",      "content": text})
+            self.messages.append({"role": "assistant", "content": answer})
+            self.all_chats[self.current_chat_id]["messages"] = self.messages
+            self._populate_sidebar_list()
+            if not self.privacy_mode:
+                self._save_all_chats()
             return
 
         # ── /digivalet org-chart command: answer locally, no LLM call ──
@@ -2756,6 +3631,23 @@ class DigiValetWindow(QMainWindow):
                 self._save_all_chats()
             return
 
+        # ── Excel Intelligence: graph generation ────────────────────────────
+        if _excel_intel and _excel_intel.has_data():
+            graph_path = _excel_intel.try_generate_graph(text)
+            if graph_path:
+                self.input_box.clear()
+                user_bubble = MessageBubble(text, "user")
+                self.chat_layout.insertWidget(self.chat_layout.count() - 1, user_bubble)
+                self._show_graph_in_chat(graph_path)
+                self.messages.append({"role": "user", "content": text})
+                self.messages.append({"role": "assistant", "content": f"📊 Graph generated: {graph_path}"})
+                self.all_chats[self.current_chat_id]["messages"] = self.messages
+                self._populate_sidebar_list()
+                if not self.privacy_mode:
+                    self._save_all_chats()
+                return
+        # ── End Excel Intelligence ───────────────────────────────────────────
+
         model = self.model_combo.currentText()
         if not model or model in ("Loading models…", "No models found", "Ollama not running"):
             self._add_error_bubble("Please select a valid Ollama model first.")
@@ -2767,14 +3659,60 @@ class DigiValetWindow(QMainWindow):
 
         self.input_box.clear()
 
-        user_bubble = MessageBubble(text, "user")
+        # ── Build user message with file context injected ────────────────
+        files_to_send = list(self._attached_files)   # snapshot before clearing
+
+        # ── Auto-learn: if user says "learn this", store files permanently ──
+        _learn_triggers = (
+            "learn this", "remember this", "store this", "memorize this",
+            "memorise this", "add to knowledge", "save to knowledge",
+            "keep this", "add to kb",
+        )
+        if files_to_send and self.kb and any(t in text.lower() for t in _learn_triggers):
+            learn_results = []
+            for fpath in files_to_send:
+                result = self.kb.learn_file(fpath)
+                learn_results.append(result)
+            # Immediately update system prompt with new KB data
+            self._refresh_system_prompt()
+            self._add_kb_notice("\n".join(learn_results))
+        if files_to_send:
+            file_sections = []
+            for fpath in files_to_send:
+                _, extracted = _read_file_content(fpath)
+                file_sections.append(extracted)
+            file_context = (
+                "\n\n---\n**Attached files for context:**\n\n"
+                + "\n\n---\n".join(file_sections)
+                + "\n---"
+            )
+            full_user_text = text + file_context
+        else:
+            full_user_text = text
+
+        # ── Protect context budget: if this turn carries real code (an
+        # attachment or a pasted code block), drop the ~50KB generic
+        # programming-syntax reference from the system prompt so the
+        # model's limited context goes toward the user's actual code
+        # instead of being silently truncated away.
+        self._refresh_system_prompt(
+            include_programming_kb=not _message_likely_contains_code(full_user_text)
+        )
+
+        user_bubble = MessageBubble(text, "user")   # show only the typed text in the bubble
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, user_bubble)
+
+        # Clear file chips immediately after capturing them
+        if files_to_send:
+            for path in list(self._attached_files):
+                self._remove_file(path)
+            self._update_attach_badge()
 
         self.typing_indicator = TypingIndicator()
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, self.typing_indicator)
         self._scroll_to_bottom()
 
-        self.messages.append({"role": "user", "content": text})
+        self.messages.append({"role": "user", "content": full_user_text})
         self.all_chats[self.current_chat_id]["messages"] = self.messages
         self._populate_sidebar_list()
         if not self.privacy_mode:
@@ -2786,13 +3724,39 @@ class DigiValetWindow(QMainWindow):
         self.input_box.setEnabled(False)
 
         self.current_thread = QThread(self)
-        self.current_worker = OllamaWorker(model, self.messages, self.ollama_host)
+        self.current_worker = OllamaWorker(
+            model, self._windowed_messages(), self.ollama_host
+        )
         self.current_worker.moveToThread(self.current_thread)
         self.current_thread.started.connect(self.current_worker.run)
         self.current_worker.token_received.connect(self._on_token)
         self.current_worker.finished.connect(self._on_finished)
         self.current_worker.error.connect(self._on_error)
         self.current_thread.start()
+
+    # ── History windowing ─────────────────────────────────────────────────
+
+    _MAX_HISTORY_TURNS = 12  # user+assistant message pairs sent to the model
+
+    def _windowed_messages(self) -> list:
+        """Return system prompt + the most recent N turns.
+
+        self.messages keeps the FULL conversation for display, export,
+        and saved history. But sending the entire unbounded history to
+        Ollama on every turn means old large pastes (or just a long
+        conversation) can silently crowd out the current message within
+        the model's context window — the same failure mode as the
+        oversized knowledge-base injection. This caps what's actually
+        sent, while leaving the saved/displayed history untouched.
+        """
+        if not self.messages:
+            return self.messages
+        system_msg = self.messages[0:1] if self.messages[0].get("role") == "system" else []
+        rest = self.messages[1:] if system_msg else self.messages
+        max_messages = self._MAX_HISTORY_TURNS * 2
+        if len(rest) > max_messages:
+            rest = rest[-max_messages:]
+        return system_msg + rest
 
     def _on_token(self, token: str):
         if self.typing_indicator:
@@ -2836,6 +3800,9 @@ class DigiValetWindow(QMainWindow):
         self.current_worker = None
         if self.current_thread:
             self.current_thread.quit()
+            self.current_thread.wait(2000)   # wait up to 2 s for thread to exit cleanly
+            self.current_thread.deleteLater()
+            self.current_thread = None
 
     def _on_error(self, err: str):
         if self.typing_indicator:
@@ -2876,10 +3843,138 @@ class DigiValetWindow(QMainWindow):
             print(f"Error purging file: {e}")
         self._new_chat()
 
+    # ── Knowledge Base Commands ────────────────────────────────────────────
+
+    def _handle_kb_command(self, text: str) -> str:
+        """Handle /kb commands for the persistent knowledge base."""
+        if not self.kb:
+            return (
+                "⚠️ Knowledge Base module not found.\n\n"
+                "Make sure **knowledge_base.py** is in the same folder as "
+                "digi_valet_chat.py, then restart Digi Valet."
+            )
+        parts = text.strip().split(None, 2)
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+
+        if sub in ("list", "status", "ls", "show"):
+            return self.kb.format_kb_status()
+
+        if sub == "forget" and len(parts) > 2:
+            result = self.kb.forget_file(parts[2].strip())
+            self._refresh_system_prompt()
+            return result
+
+        if sub == "forget":
+            return "Usage: `/kb forget <filename>`\nExample: `/kb forget OrgTree.csv`"
+
+        if sub in ("learn", "add", "store"):
+            if self._attached_files:
+                results = []
+                for fpath in list(self._attached_files):
+                    results.append(self.kb.learn_file(fpath))
+                self._refresh_system_prompt()
+                return "\n\n".join(results)
+            return (
+                "No files attached.\n\n"
+                "Attach a file first using the **+** button, then type `/kb learn`.\n"
+                "Or attach a file and say **'learn this file'**."
+            )
+
+        if sub == "clear":
+            files = self.kb.list_files()
+            count = len(files)
+            if count == 0:
+                return "Knowledge base is already empty."
+            for f in files:
+                self.kb.forget_file(f["filename"])
+            self._refresh_system_prompt()
+            return f"🗑️ Cleared {count} file(s) from knowledge base."
+
+        if sub == "help":
+            return (
+                "📚 **Knowledge Base Commands**\n\n"
+                "• `/kb list` — show all stored files\n"
+                "• `/kb learn` — store attached file(s) permanently *(attach first)*\n"
+                "• `/kb forget <filename>` — remove a file\n"
+                "• `/kb clear` — wipe the entire knowledge base\n"
+                "• `/kb help` — show this help\n\n"
+                "**Shortcut:** Attach any file and type **'learn this file'** — "
+                "the model will remember it in all future conversations."
+            )
+
+        return self.kb.format_kb_status()
+
+    def _add_kb_notice(self, text: str):
+        """Show a green knowledge-base status notice in the chat."""
+        notice = QLabel(f"📚  {text}")
+        notice.setFont(QFont("Georgia", 9))
+        notice.setWordWrap(True)
+        notice.setStyleSheet(
+            "color: #6a9e6a; padding: 6px 24px; background: transparent;"
+        )
+        notice.setAlignment(Qt.AlignLeft)
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, notice)
+        self._scroll_to_bottom()
+
+    def _on_scroll_value_changed(self, value: int):
+        """If the user drags the bar away from the bottom, pause auto-scroll."""
+        sb = self.scroll_area.verticalScrollBar()
+        at_bottom = (value >= sb.maximum() - 30)   # 30px tolerance
+        if not at_bottom:
+            self._auto_scroll = False
+        else:
+            self._auto_scroll = True
+
     def _scroll_to_bottom(self):
-        QTimer.singleShot(30, lambda: self.scroll_area.verticalScrollBar().setValue(
-            self.scroll_area.verticalScrollBar().maximum()
-        ))
+        """Only scroll if auto-scroll is enabled (user hasn't scrolled up)."""
+        if self._auto_scroll:
+            QTimer.singleShot(30, lambda: self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            ))
+
+    # ── Excel Graph Display ──────────────────────────────────────────────────
+
+    def _show_graph_in_chat(self, graph_path: str):
+        """Display a generated graph PNG inline in the chat area."""
+        px = QPixmap(graph_path)
+        if px.isNull():
+            self._add_error_bubble(f"Graph saved but could not display: {graph_path}")
+            return
+        max_w = min(700, self.scroll_area.width() - 40)
+        if px.width() > max_w:
+            px = px.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
+
+        container = QFrame()
+        container.setObjectName("assistantBubble")
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(10, 10, 10, 10)
+        vl.setSpacing(6)
+
+        hdr = QLabel("📊  Graph")
+        hdr.setFont(QFont("Georgia", 9, QFont.Bold))
+        hdr.setStyleSheet("color: #c8a96e;" if _DARK_MODE else "color: #8b6914;")
+        vl.addWidget(hdr)
+
+        img_label = QLabel()
+        img_label.setPixmap(px)
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.addWidget(img_label)
+
+        path_label = QLabel(f"Saved: {graph_path}")
+        path_label.setFont(QFont("Georgia", 7))
+        path_label.setStyleSheet("color: #5a5048;" if _DARK_MODE else "color: #a09080;")
+        vl.addWidget(path_label)
+
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, container)
+        QTimer.singleShot(60, lambda: self._scroll_to_bottom())
+
+    def _handle_excel_command(self, text: str) -> str:
+        """Handle /excel status command."""
+        if _excel_intel is None:
+            return ("⚠️ Excel Intelligence not available.\n\n"
+                    "Install it: `pip install matplotlib openpyxl pandas`\n"
+                    "Then place `excel_intelligence.py` next to this file.")
+        return _excel_intel.get_db_stats()
 
     # ── Search / Rename ────────────────────────────────────────────────────
 
@@ -2924,6 +4019,8 @@ class DigiValetWindow(QMainWindow):
 
         title = self.all_chats.get(self.current_chat_id, {}).get("title", "conversation")
         safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
+        if not safe_title:
+            safe_title = "conversation"
 
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -2954,15 +4051,15 @@ class DigiValetWindow(QMainWindow):
 
     def _save_all_chats(self):
         try:
-            with open(self.chat_history_file, 'w') as f:
-                json.dump(self.all_chats, f, indent=2)
+            with open(self.chat_history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.all_chats, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving chat history: {e}")
 
     def _load_all_chats(self):
         try:
             if self.chat_history_file.exists():
-                with open(self.chat_history_file, 'r') as f:
+                with open(self.chat_history_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
         except Exception as e:
             print(f"Error loading chat history: {e}")
@@ -3074,7 +4171,6 @@ def main():
     except Exception:
         pass
     app.setStyleSheet(DARK_STYLESHEET if dark else LIGHT_STYLESHEET)
-    app.setWindowIcon(make_app_icon(dark))
 
     window = DigiValetWindow()
     window.show()
